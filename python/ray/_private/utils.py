@@ -49,6 +49,10 @@ if TYPE_CHECKING:
 
 INT32_MAX = (2**31) - 1
 
+RAY_EXPERIMENTAL_NVIDIA_GPU_NUMA_AFFINITY_ENV_VAR = (
+    "RAY_EXPERIMENTAL_NVIDIA_GPU_NUMA_AFFINITY"
+)
+
 
 pwd = None
 if sys.platform != "win32":
@@ -311,6 +315,103 @@ def reset_visible_accelerator_env_vars(
             os.environ.pop(env_var, None)
         else:
             os.environ[env_var] = env_value
+
+
+def _cpu_affinity_words_to_cpu_set(affinity_words) -> set:
+    cpu_set = set()
+    for word_index, word in enumerate(affinity_words):
+        word_value = int(word)
+        bit_offset = word_index * 64
+        while word_value:
+            lowest_bit = word_value & -word_value
+            cpu_set.add(bit_offset + lowest_bit.bit_length() - 1)
+            word_value ^= lowest_bit
+    return cpu_set
+
+
+def _get_nvidia_gpu_cpu_affinity(gpu_id: int) -> set:
+    import ray._private.thirdparty.pynvml as pynvml
+
+    cpu_count = os.cpu_count() or 1024
+    cpu_set_size = max(1, (cpu_count + 63) // 64)
+    try:
+        pynvml.nvmlInit()
+        try:
+            handle = pynvml.nvmlDeviceGetHandleByIndex(gpu_id)
+            affinity_words = pynvml.nvmlDeviceGetCpuAffinity(handle, cpu_set_size)
+            return _cpu_affinity_words_to_cpu_set(affinity_words)
+        finally:
+            pynvml.nvmlShutdown()
+    except pynvml.NVMLError:
+        return set()
+
+
+def set_nvidia_gpu_numa_affinity_if_enabled() -> Optional[set]:
+    """Optionally bind this worker to CPUs local to assigned NVIDIA GPUs.
+
+    This experimental hook is deliberately narrow. It only acts when explicitly
+    enabled, the worker has whole assigned GPU resources, the assigned GPU IDs
+    can be mapped through vendored NVML, and the GPU-local CPU set intersects
+    the process' existing scheduler affinity. The returned set is the original
+    scheduler affinity and should be restored after normal tasks complete.
+    """
+    from ray._private.ray_constants import env_bool
+
+    if (
+        # This hook changes process CPU affinity, so it must be explicitly enabled.
+        not env_bool(RAY_EXPERIMENTAL_NVIDIA_GPU_NUMA_AFFINITY_ENV_VAR, False)
+        # CPU affinity APIs are only available on supported platforms such as Linux.
+        or not hasattr(os, "sched_getaffinity")
+        or not hasattr(os, "sched_setaffinity")
+    ):
+        return None
+
+    runtime_ctx = ray.get_runtime_context()
+    accelerator_ids = runtime_ctx.get_accelerator_ids().get("GPU", [])
+    assigned_gpu_resource = runtime_ctx.get_assigned_resources().get("GPU", 0)
+
+    if (
+        # The worker has no assigned NVIDIA GPU.
+        not accelerator_ids
+        # Fractional GPU resources do not map cleanly to GPU-local CPU sets.
+        or assigned_gpu_resource != int(assigned_gpu_resource)
+        # The whole-GPU resource count should match the assigned GPU IDs.
+        or int(assigned_gpu_resource) != len(accelerator_ids)
+    ):
+        return None
+
+    try:
+        gpu_ids = [int(gpu_id) for gpu_id in accelerator_ids]
+    except (TypeError, ValueError):
+        return None
+
+    gpu_cpu_sets = []
+    for gpu_id in gpu_ids:
+        gpu_cpu_set = _get_nvidia_gpu_cpu_affinity(gpu_id)
+        if not gpu_cpu_set:
+            return None
+        gpu_cpu_sets.append(gpu_cpu_set)
+
+    # If the assigned GPUs span multiple NUMA-local CPU sets, there is no single
+    # CPU affinity that is local to all of them. Keep the existing affinity.
+    if len({frozenset(cpu_set) for cpu_set in gpu_cpu_sets}) > 1:
+        return None
+
+    original_affinity = set(os.sched_getaffinity(0))
+    # Respect any existing process CPU restrictions from containers, cgroups,
+    # cpusets, taskset, or platform configuration by only narrowing affinity.
+    selected_cpu_set = original_affinity & gpu_cpu_sets[0]
+    if not selected_cpu_set:
+        return None
+
+    os.sched_setaffinity(0, selected_cpu_set)
+    return original_affinity
+
+
+def reset_nvidia_gpu_numa_affinity(original_affinity: Optional[set]) -> None:
+    """Restore the scheduler affinity captured by the NUMA affinity hook."""
+    if original_affinity is not None and hasattr(os, "sched_setaffinity"):
+        os.sched_setaffinity(0, original_affinity)
 
 
 class Unbuffered(object):
